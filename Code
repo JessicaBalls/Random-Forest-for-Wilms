@@ -1,0 +1,254 @@
+# import packages 
+
+import pandas as pd
+import matplotlib.pyplot as plt 
+import numpy as np
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from combat.pycombat import pycombat
+from sklearn.decomposition import PCA
+
+# Import data 
+cardA = pd.read_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\Wilms and additional controls\Sample results slim (A).csv')
+pivot_A = cardA.pivot(index='Sample Name', columns='Target Name', values= 'Mean Adjusted Equivalent Cq')
+pivot_A = pivot_A.replace(to_replace= ['-'], value=[40]).astype(float)
+cardB = pd.read_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\Wilms and additional controls\Sample results slim (B).csv')
+pivot_B = cardB.pivot(index='Sample Name', columns='Target Name', values= 'Mean Adjusted Equivalent Cq')
+pivot_B = pivot_B.replace(to_replace= ['-'], value=[40]).astype(float)
+
+
+# normalise ct values using exogenous control ath-159a  
+A_ath159a = pivot_A['ath-miR159a-000338']
+A_Nfactor = A_ath159a - A_ath159a.median()
+A_norm = pivot_A.sub(A_Nfactor, axis=0)
+
+B_ath159a = pivot_B['ath-miR159a-000338']
+B_Nfactor = B_ath159a - B_ath159a.median()
+B_norm = pivot_B.sub(B_Nfactor, axis=0)
+
+# add 'batch' column 
+AB_norm = A_norm.merge(B_norm, on='Sample Name', how='outer')
+AB_norm = AB_norm.reset_index()
+AB_norm['Batch'] = AB_norm['Sample Name'].apply(lambda x: 
+        '2' if 'CC' in x else
+        '2' if any(y in x for y in ['Control_01S', 'Control_01SR', 'Control_02S', 'Control_03S', 'Control_04S', 'Control_05S']) else
+        '2' if 'EC' in x else
+        '2' if 'Seminoma' in x else
+        '1' if 'Wilms' in x else
+        '1'
+    )  
+AB_norm = AB_norm.set_index('Sample Name')
+
+# Remove nan values (CC_04R)
+AB_norm = AB_norm.dropna()
+
+
+# remove control miRNAs
+AB_norm_fil = AB_norm.loc[:, ~AB_norm.columns.str.contains('ath-miR159a|RNU44|RNU48|U6 snRNA', case=False)]
+
+
+# normalise ct vlaues using PyCombat (accounts for batch effects) 
+# the dataframe must be:
+    # the indexes correspond to the gene names
+    # the column names correspond to the sample names
+data = AB_norm_fil[AB_norm_fil.columns[:-1]] # remove 'batch' column
+data_tran = data.transpose()
+# Remove miRNAs where the variance=0 (e.g. all ct values are 40) Combat doesn't run if there are variance = 0 
+data_var = data_tran.copy()
+data_var['variance'] = np.var(data_var, axis=1)
+# check to see if there are targets with variance=0
+print(data_var['variance'].min()) # min = 1.2622e-29 
+
+# data for correction 
+batch = AB_norm_fil['Batch'].tolist()
+data_corrected = pycombat(data_tran, batch)
+corrected_data = data_corrected.transpose()
+corrected_data = corrected_data.reset_index()
+
+corrected_data['Sample Type'] = corrected_data['Sample Name'].apply(lambda x: 
+    'CC' if 'CC' in x else
+    'S Control' if any(y in x for y in ['Control_01S', 'Control_01SR', 'Control_02S', 'Control_03S', 'Control_04S', 'Control_05S']) else
+    'EC' if 'EC' in x else
+    'Seminoma' if 'Seminoma' in x else
+    'Wilms' if 'Wilms' in x else
+    'W Control'
+)
+     
+corrected_data['Wilms?'] = corrected_data['Sample Name'].apply(lambda x: 'Wilms' if 'Wilms' in x else 'Not Wilms')   
+corrected_data = corrected_data.set_index('Sample Name')
+
+
+# check for duplicates 
+print(len(corrected_data.columns))
+print(len(set(corrected_data.columns))) # There are no duplicates 
+
+
+#%% PCA plot to visualise batch distribution of normalised ct values  
+# Separate features and labels
+X = corrected_data.iloc[:, :-2]  # Select all columns except last two (Sample type and Wilms?)
+y = batch
+# Standardize the data (PCA works best with standardized data)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Perform PCA (reduce to 2 components for visualization)
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+# Convert to DataFrame for plotting
+pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"])
+pca_df["Batch"] = y
+pca_df['Sample type'] = corrected_data['Sample Type']
+
+# Plot PCA results
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=pca_df, x="PC1", y="PC2", hue="Batch", alpha=0.7)
+plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.2f}% variance)")
+plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.2f}% variance)")
+plt.title("PCA of normalised Ct values")
+plt.legend(title="Batch Type")
+plt.grid(True)
+plt.show()
+
+
+
+#%% Filtering out low abundance miRNAs; defiined as miRNAs which have a mean ct vlaue > 28 
+Wilms = corrected_data[corrected_data['Wilms?'] == 'Wilms']
+Wilms_num = Wilms.iloc[:,:-2]
+
+num_Wilms = Wilms_num.transpose()
+num_Wilms['mean'] = num_Wilms.mean(axis=1)
+
+mean_below_28 = num_Wilms[num_Wilms['mean']<28]
+miRNAs_list = mean_below_28.index.tolist()
+
+
+final_data = corrected_data[miRNAs_list + ['Wilms?']]
+final_data['Wilms?'] = final_data['Wilms?'].replace(to_replace=['Wilms', 'Not Wilms'], value=[1,0])
+
+
+# Random Forest Classifier  
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report 
+import shap 
+import numpy as np
+
+# assign variables 
+y = final_data['Wilms?']
+x = final_data.iloc[:,:-1]
+
+x_train, x_test, y_train, y_test = train_test_split(x, y, random_state=42, test_size=0.3, stratify=y)
+
+clf = RandomForestClassifier(random_state=42, n_estimators=100, bootstrap=True, criterion='gini')
+clf.fit(x_train, y_train)
+y_pred_clf = clf.predict(x_test)
+
+accuracy_clf = accuracy_score(y_test, y_pred_clf)
+classification_clf = classification_report(y_test, y_pred_clf)
+
+print(accuracy_clf)
+print(classification_clf)
+
+# Visualising 5 decison tree within random forest
+fig, axes = plt.subplots(nrows = 1,ncols = 5,figsize = (10,2), dpi=900)
+for index in range(0, 5):
+    plot_tree(clf.estimators_[index],
+                   feature_names = x.columns, 
+                   class_names=True,
+                   filled = True,
+                   ax = axes[index]);
+plt.title('5 of the decision trees within the random forest classifier')
+plt.show()
+
+
+# Calculating Feature Importance 
+importance = pd.Series(clf.feature_importances_, index = x.columns)
+importance_sorted = importance.sort_values(ascending=True)
+importance_sorted_filtered = importance_sorted[importance_sorted > 0.01] # don't want to plot features with very low importance 
+
+# Plot results 
+importance_sorted_filtered.plot(kind='barh')
+plt.xticks(fontsize = 10)
+plt.yticks(fontsize = 7)
+plt.ylabel('')
+plt.xlabel('mean decrease in impurity')
+plt.title('Feature importance: 298 miRNAs')
+plt.show()
+
+# Calculating SHAP 
+explainer = shap.TreeExplainer(clf)
+shap_values = explainer.shap_values(x_train)
+# Aggregate SHAP values across classes
+mean_shap_values = np.mean(np.abs(shap_values), axis=2)
+# Plot aggregated SHAP values
+shap.summary_plot(mean_shap_values, x_train, plot_type='bar', show=False, max_display=20)
+plt.title('SHAP scores for the top 20 mmiRNAs', fontsize=18)
+plt.show()
+
+
+
+# Calculate mean SHAP per feature across all samples
+mean_shap_per_feature = np.mean(mean_shap_values, axis=0)
+
+# Reassign cleaned feature names
+clean_feature_names = x_train.columns # temporariliy took off the .str[-7] to get full names 
+
+# Create a Series with feature names
+shap_series = pd.Series(mean_shap_per_feature, index=clean_feature_names)
+
+# rank by shap 
+shap_ranked = shap_series.sort_values(ascending=False)
+
+
+# Further refining the candidate list with Log2FC 
+# Using Log2FC to determine which miRNAs are upregulated 
+Log2FC = final_data.copy()
+Log2FC = Log2FC.iloc[:,:-1] # remove 'Wilms?' column 
+Log2FC = Log2FC.transpose()
+        
+Wilms_samples = Log2FC.filter(regex = 'Wilms')
+Wilms_samples['Wilms mean']= Wilms_samples.mean(axis=1)
+
+non_wilms_samples = Log2FC.filter(regex='CC|Con|EC|Sem')
+non_wilms_samples['non-w mean'] = non_wilms_samples.mean(axis=1)
+
+Log2FC['Wilms mean'] = Wilms_samples['Wilms mean']
+Log2FC['non-w mean'] = non_wilms_samples['non-w mean']
+
+Log2FC['difference'] = Log2FC['Wilms mean'] - Log2FC['non-w mean']
+
+Log2FC['Fold change'] = 2 ** -Log2FC['difference'] # 2^difference (2^delta_delta_ct)
+
+Log2FC['Log2FC'] = np.log2(Log2FC['Fold change'])
+
+print(max(Log2FC['Log2FC'])) # 2.9211
+
+# select only positive Log2FC (upregulated)
+upreg_Log2FC = Log2FC[Log2FC['Log2FC']>0]
+# Filter for only Log2FC > 1 
+upreg_Log2FC_1 = Log2FC[Log2FC['Log2FC']>1]
+print(upreg_Log2FC) #82 miRNAs 
+
+# export dfs 
+Log2FC.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\normalised values with Log2FC - 298 miRNAs.csv')
+upreg_Log2FC.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\upreg norm with Log2FC - 217 miRNAs.csv')
+upreg_Log2FC_1.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\upreg norm with Log2FC_1 - 82 miRNAs.csv')
+
+
+# add SHAP ranking to Log2FC data 
+shap_ranked_dropindx = shap_ranked.reset_index()
+Log2FC_dropindx = Log2FC.reset_index()
+everything_together = Log2FC_dropindx.merge(shap_ranked_dropindx, on='Target Name', how='outer')
+
+upreg_dropindx = upreg_Log2FC.reset_index()
+upreg_together = upreg_dropindx.merge(shap_ranked_dropindx, on='Target Name', how='inner')
+upreg_dropindx_1 = upreg_Log2FC_1.reset_index()
+upreg_log1_together = upreg_dropindx_1.merge(shap_ranked_dropindx, on='Target Name', how='inner')
+
+# export 
+everything_together.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\ALL miRNAs results.csv')
+upreg_together.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\upreg miRNAs results.csv')
+upreg_log1_together.to_csv(r'C:\Users\Jsscb\OneDrive - University of Exeter\Documents\University\Placement\Wilms Tumour\Wilms Data\upreg log1 miRNAs results shap.csv')
+
